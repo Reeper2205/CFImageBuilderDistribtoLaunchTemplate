@@ -1,0 +1,310 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Image Builder Lab Infrastructure'
+
+Parameters:
+  EnvironmentName:
+    Description: Environment name prefix
+    Type: String
+    Default: 'ImageBuilderLab'
+    
+  VpcCIDR:
+    Description: CIDR range for VPC
+    Type: String
+    Default: '10.0.0.0/16'
+
+Resources:
+  # VPC and Networking Components
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: ImageBuilderLab-VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: ImageBuilderLab-IGW
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC 
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: '10.0.0.0/24'
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: ImageBuilderLab-Public-Subnet
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: '10.0.1.0/24'
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: ImageBuilderLab-Private-Subnet
+
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: ImageBuilderLab-NAT-EIP
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: ImageBuilderLab-NAT
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: ImageBuilderLab-Public-RT
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: ImageBuilderLab-Private-RT
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  DefaultPrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+
+  ImageBuilderSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: ImageBuilderLab-SG
+      GroupDescription: Security group for Image Builder Lab
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ImageBuilderLab-SG
+
+  ImageBuilderLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub imagebuilderlab-logs-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ImageBuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ImageBuilderLab-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilder
+      Policies:
+        - PolicyName: ImageBuilderS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ImageBuilderLogsBucket.Arn
+                  - !Sub ${ImageBuilderLogsBucket.Arn}/*
+
+  ImageBuilderInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: ImageBuilderLab-Instance-Profile
+      Path: "/"
+      Roles:
+        - !Ref ImageBuilderRole
+  
+  EC2LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${EnvironmentName}-LaunchTemplate
+      LaunchTemplateData:
+        InstanceType: t3.micro
+        SecurityGroupIds: 
+          - !Ref ImageBuilderSecurityGroup
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${EnvironmentName}-Instance
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            echo "Hello from ${EnvironmentName} instance!"
+
+  # We'll update this later with the latest AMI ID
+  # Image Builder Components
+  ImageBuilderPipeline:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Name: ImageBuilderLab-Pipeline
+      Description: 'Creates an Amazon Linux 2 image for ImageBuilder Lab'
+      Status: ENABLED
+      ImageRecipeArn: !Ref ImageRecipe
+      InfrastructureConfigurationArn: !Ref InfrastructureConfiguration
+      DistributionConfigurationArn: !Ref DistributionConfiguration
+
+  ImageRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: ImageBuilderLab-Recipe
+      Version: '1.0.0'
+      ParentImage: !Sub 'arn:aws:imagebuilder:${AWS::Region}:aws:image/amazon-linux-2-x86/x.x.x'
+      Components:
+        - ComponentArn: !Ref ImageComponent
+      BlockDeviceMappings:
+        - DeviceName: '/dev/xvda'
+          Ebs:
+            VolumeSize: 8
+            VolumeType: 'gp2'
+
+  ImageComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: ImageBuilderLab-Component
+      Platform: 'Linux'
+      Version: '1.0.0'
+      Data: |
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: ImageBuilderLab-HelloWorld
+                action: ExecuteBash
+                onFailure: Continue
+                inputs:
+                  commands:
+                    - echo 'ImageBuilder Lab Component Test'
+
+  InfrastructureConfiguration:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: ImageBuilderLab-Infrastructure
+      Description: 'Infrastructure configuration for ImageBuilder Lab'
+      InstanceProfileName: !Ref ImageBuilderInstanceProfile
+      InstanceTypes: 
+        - 't2.micro'
+      SecurityGroupIds: 
+        - !Ref ImageBuilderSecurityGroup
+      SubnetId: !Ref PrivateSubnet1
+      TerminateInstanceOnFailure: true
+      Logging:
+        S3Logs:
+          S3BucketName: !Ref ImageBuilderLogsBucket
+          S3KeyPrefix: '/ImageBuilderLab'
+
+  DistributionConfiguration:
+    Type: AWS::ImageBuilder::DistributionConfiguration
+    Properties:
+      Name: ImageBuilderLab-Distribution
+      Distributions:
+        - Region: !Ref 'AWS::Region'
+          AmiDistributionConfiguration:
+            Name: 'ImageBuilderLab-AMI-{{ imagebuilder:buildDate }}'
+            AmiTags:
+              Project: ImageBuilderLab
+            TargetAccountIds: 
+              - !Ref 'AWS::AccountId'
+          LaunchTemplateConfigurations:
+            - LaunchTemplateId: !Ref EC2LaunchTemplate
+              AccountId: !Ref 'AWS::AccountId'
+
+
+Outputs:
+  VpcId:
+    Description: ImageBuilder Lab VPC ID
+    Value: !Ref VPC
+
+  PrivateSubnetId:
+    Description: ImageBuilder Lab Private Subnet ID
+    Value: !Ref PrivateSubnet1
+
+  SecurityGroupId:
+    Description: ImageBuilder Lab Security Group ID
+    Value: !Ref ImageBuilderSecurityGroup
+
+  LogsBucketName:
+    Description: ImageBuilder Lab S3 Bucket for Logs
+    Value: !Ref ImageBuilderLogsBucket
+
+  PipelineArn:
+    Description: ImageBuilder Lab Pipeline ARN
+    Value: !Ref ImageBuilderPipeline
+
+  LaunchTemplateId:
+    Description: EC2 Launch Template ID
+    Value: !Ref EC2LaunchTemplate
+  LaunchTemplateName:
+    Description: EC2 Launch Template Name
+    Value: !Sub ${EnvironmentName}-LaunchTemplate
